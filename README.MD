@@ -70,7 +70,7 @@ graph TD
 ### Technology Stack
 
 #### Backend
-- **Language**: Python 3.11+ (Django REST Framework)
+- **Language**: Python 3.11+ (FastAPI + SQLAlchemy)
 - **Database**: PostgreSQL + Redis (caching)
 - **AI/ML**: 
   - OpenAI Whisper (speech-to-text)
@@ -293,17 +293,18 @@ class Lead(models.Model):
 import openai
 from twilio.twiml import VoiceResponse
 import speech_recognition as sr
+from fastapi import HTTPException
 
 class AIVoiceHandler:
     def __init__(self, language='en', business_context=None):
         self.language = language
         self.context = business_context
         
-    def handle_call(self, call_sid, caller_number):
+    async def handle_call(self, call_sid: str, caller_number: str):
         response = VoiceResponse()
         
         # Greeting in appropriate language
-        greeting = self.get_greeting()
+        greeting = await self.get_greeting()
         response.say(greeting, language=self.language)
         
         # Start conversation loop
@@ -315,15 +316,15 @@ class AIVoiceHandler:
         
         return str(response)
     
-    def process_speech(self, audio_data):
+    async def process_speech(self, audio_data):
         # Convert speech to text
-        transcript = self.speech_to_text(audio_data)
+        transcript = await self.speech_to_text(audio_data)
         
         # Process intent
-        intent = self.extract_intent(transcript)
+        intent = await self.extract_intent(transcript)
         
         # Generate response
-        ai_response = self.generate_response(intent, transcript)
+        ai_response = await self.generate_response(intent, transcript)
         
         return ai_response
 ```
@@ -331,21 +332,29 @@ class AIVoiceHandler:
 #### 3. Lead Qualification Engine
 ```python
 # leads/qualification.py
+from typing import Dict, Any
+from pydantic import BaseModel
+
+class QualificationResult(BaseModel):
+    status: str
+    score: int
+    action: str
+    confidence: float
+
 class LeadQualificationEngine:
-    def __init__(self, business_rules):
+    def __init__(self, business_rules: Dict[str, Any]):
         self.rules = business_rules
         
-    def qualify_lead(self, conversation_data):
+    async def qualify_lead(self, conversation_data: Dict[str, Any]) -> QualificationResult:
         score = 0
-        qualification = {}
         
         # Extract key information
-        budget = self.extract_budget(conversation_data)
-        timeline = self.extract_timeline(conversation_data)
-        needs = self.extract_needs(conversation_data)
+        budget = await self.extract_budget(conversation_data)
+        timeline = await self.extract_timeline(conversation_data)
+        needs = await self.extract_needs(conversation_data)
         
         # Score based on business rules
-        if budget >= self.rules['min_budget']:
+        if budget and budget >= self.rules.get('min_budget', 0):
             score += 30
             
         if timeline in ['urgent', 'this_week']:
@@ -353,16 +362,26 @@ class LeadQualificationEngine:
             
         # Decision tree for next actions
         if score >= 70:
-            qualification['status'] = 'hot'
-            qualification['action'] = 'immediate_callback'
+            return QualificationResult(
+                status='hot',
+                score=score,
+                action='immediate_callback',
+                confidence=0.9
+            )
         elif score >= 40:
-            qualification['status'] = 'warm'
-            qualification['action'] = 'schedule_follow_up'
+            return QualificationResult(
+                status='warm', 
+                score=score,
+                action='schedule_follow_up',
+                confidence=0.7
+            )
         else:
-            qualification['status'] = 'cold'
-            qualification['action'] = 'nurture_sequence'
-            
-        return qualification
+            return QualificationResult(
+                status='cold',
+                score=score,
+                action='nurture_sequence',
+                confidence=0.5
+            )
 ```
 
 ### Frontend Dashboard
@@ -587,13 +606,11 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your configuration
 
-# Database setup
-python manage.py makemigrations
-python manage.py migrate
-python manage.py createsuperuser
+# Database setup (using Alembic)
+alembic upgrade head
 
 # Start development server
-python manage.py runserver
+uvicorn main:app --reload --port 8000
 ```
 
 ### Frontend Setup
@@ -639,28 +656,35 @@ npm run ios      # iOS
 ```python
 # tests/test_call_handler.py
 import pytest
-from django.test import TestCase
-from call_handler.models import CallSession, Lead
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+from main import app
+from models import CallSession, Lead
 from ai_engine.voice_handler import AIVoiceHandler
 
-class TestAIVoiceHandler(TestCase):
-    def setUp(self):
-        self.handler = AIVoiceHandler(language='en')
+client = TestClient(app)
+
+class TestAIVoiceHandler:
+    @pytest.fixture
+    def handler(self):
+        return AIVoiceHandler(language='en')
     
-    def test_greeting_generation(self):
-        greeting = self.handler.get_greeting()
-        self.assertIn('Hello', greeting)
-        self.assertIn('how can I help', greeting.lower())
+    @pytest.mark.asyncio
+    async def test_greeting_generation(self, handler):
+        greeting = await handler.get_greeting()
+        assert 'Hello' in greeting
+        assert 'how can i help' in greeting.lower()
     
-    def test_lead_qualification(self):
+    @pytest.mark.asyncio
+    async def test_lead_qualification(self, handler):
         conversation = {
             'transcript': 'I need a plumber urgently, budget is $500',
             'caller_info': {'phone': '+27123456789'}
         }
         
-        result = self.handler.qualify_lead(conversation)
-        self.assertGreaterEqual(result['score'], 70)
-        self.assertEqual(result['status'], 'hot')
+        result = await handler.qualify_lead(conversation)
+        assert result.score >= 70
+        assert result.status == 'hot'
 ```
 
 ### Integration Tests
@@ -728,20 +752,26 @@ export const KPIs = {
 ```python
 # monitoring/performance.py
 import time
+import asyncio
 from functools import wraps
-from django.core.cache import cache
+from typing import Any, Callable
+import redis
 import logging
 
 logger = logging.getLogger(__name__)
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
-def monitor_performance(metric_name):
-    def decorator(func):
+def monitor_performance(metric_name: str):
+    def decorator(func: Callable) -> Callable:
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             start_time = time.time()
             
             try:
-                result = func(*args, **kwargs)
+                if asyncio.iscoroutinefunction(func):
+                    result = await func(*args, **kwargs)
+                else:
+                    result = func(*args, **kwargs)
                 status = 'success'
                 return result
             except Exception as e:
@@ -751,20 +781,21 @@ def monitor_performance(metric_name):
             finally:
                 duration = time.time() - start_time
                 
-                # Store metrics
-                cache.set(f'metric_{metric_name}_duration', duration, 300)
-                cache.set(f'metric_{metric_name}_status', status, 300)
+                # Store metrics in Redis
+                redis_client.setex(f'metric_{metric_name}_duration', 300, duration)
+                redis_client.setex(f'metric_{metric_name}_status', 300, status)
                 
                 # Log performance
                 logger.info(f'{metric_name} completed in {duration:.2f}s with {status}')
                 
-        return wrapper
+        return async_wrapper
     return decorator
 
 @monitor_performance('ai_call_processing')
-def process_ai_call(call_data):
+async def process_ai_call(call_data: dict) -> dict:
     # AI processing logic
-    pass
+    await asyncio.sleep(0.1)  # Simulate processing
+    return {"status": "processed"}
 ```
 
 ---
@@ -803,6 +834,7 @@ services:
       - redis
     ports:
       - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
 
   celery:
     build: .
@@ -904,32 +936,76 @@ spec:
 ```python
 # security/middleware.py
 import jwt
-from django.http import JsonResponse
-from django.conf import settings
+import time
+from fastapi import Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from typing import Dict
+import redis
 
-class SecurityMiddleware:
-    def __init__(self, get_response):
-        self.get_response = get_response
+redis_client = redis.Redis(host='localhost', port=6379, db=1)
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, rate_limit: int = 100):
+        super().__init__(app)
+        self.rate_limit = rate_limit
     
-    def __call__(self, request):
+    async def dispatch(self, request: Request, call_next):
         # Rate limiting
-        if self.is_rate_limited(request):
-            return JsonResponse({'error': 'Rate limit exceeded'}, status=429)
+        client_ip = request.client.host
+        if await self.is_rate_limited(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={'error': 'Rate limit exceeded'}
+            )
         
-        # API authentication
-        if request.path.startswith('/api/'):
+        # API authentication for /api/ endpoints
+        if request.url.path.startswith('/api/'):
             token = self.get_auth_token(request)
-            if not self.validate_token(token):
-                return JsonResponse({'error': 'Invalid token'}, status=401)
+            if not await self.validate_token(token):
+                return JSONResponse(
+                    status_code=401,
+                    content={'error': 'Invalid token'}
+                )
         
-        response = self.get_response(request)
+        response = await call_next(request)
         
         # Security headers
-        response['X-Content-Type-Options'] = 'nosniff'
-        response['X-Frame-Options'] = 'DENY' 
-        response['X-XSS-Protection'] = '1; mode=block'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY' 
+        response.headers['X-XSS-Protection'] = '1; mode=block'
         
         return response
+    
+    async def is_rate_limited(self, client_ip: str) -> bool:
+        key = f"rate_limit:{client_ip}"
+        current = redis_client.get(key)
+        
+        if current is None:
+            redis_client.setex(key, 3600, 1)  # 1 hour window
+            return False
+        
+        if int(current) >= self.rate_limit:
+            return True
+            
+        redis_client.incr(key)
+        return False
+    
+    def get_auth_token(self, request: Request) -> str:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return None
+        return auth_header.split(' ')[1]
+    
+    async def validate_token(self, token: str) -> bool:
+        if not token:
+            return False
+        try:
+            # Add your JWT validation logic here
+            decoded = jwt.decode(token, "your-secret-key", algorithms=["HS256"])
+            return True
+        except jwt.InvalidTokenError:
+            return False
 ```
 
 ---
@@ -975,7 +1051,7 @@ class SecurityMiddleware:
 ## 📞 Contact & Support
 
 ### Development Team
-- **Lead Developer**: Stewart  - your.email@africall.com
+- **Lead Developer**: [Your Name] - your.email@africall.com
 - **AI/ML Engineer**: TBH
 - **Mobile Developer**: TBH  
 - **DevOps Engineer**: TBH
